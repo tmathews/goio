@@ -30,10 +30,35 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"regexp"
+	"strings"
 )
+
+// This is the delimiter we use for commands in the protocol. The other way to determine how to read is by declaring
+// size of data being transferred ahead of time while being in context of an action. Using null byte allows us to use
+// newlines for our inputs without disruptions.
+const (
+	NullMarker = 0x0
+	StatusOK   = 0x0
+)
+
+var (
+	ReCommand               = regexp.MustCompile(`^[A-Z]+$`)
+	ErrInvalidCommandFormat = errors.New("invalid command format")
+)
+
+type StatusError struct {
+	Code    byte
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	return e.Message
+}
 
 // Checks if the error is one of the connection closing by error or on purpose.
 func IsClosed(err error) bool {
@@ -168,6 +193,81 @@ func (sw *StreamWriter) Terminate() error {
 
 func NewStreamWriter(w io.Writer) *StreamWriter {
 	return &StreamWriter{writer: w}
+}
+
+// Reads the first byte and checks if it's null. If it's not it means the command failed. If the command did fail
+// then we proceed to read the connection until the next null byte, this is the error message. When this method returns
+// nil it means that the status was StatusOK.
+func ReadStatus(r io.Reader) error {
+	res := make([]byte, 1)
+	if _, err := r.Read(res); err != nil {
+		return err
+	}
+	if res[0] == StatusOK {
+		return nil
+	}
+	message, err := ReadStringUntilNull(r)
+	if err != nil {
+		return err
+	}
+	return &StatusError{Code: res[0], Message: message}
+}
+
+// Do the thing.
+func Ok(w io.Writer) error {
+	_, err := w.Write([]byte{StatusOK})
+	return err
+}
+
+// Writing a non-OK status is different because there is an optional message attached to the status code. This means
+// that the status is written followed by a string followed by a non-optional NullMarker. The message should obviously
+// not contain any NullMarker in it.
+func NotOk(w io.Writer, code byte, message string) error {
+	buf := []byte{code}
+	buf = append(buf, []byte(message)...)
+	buf = append(buf, NullMarker)
+	_, err := w.Write(buf)
+	return err
+}
+
+func Command(rw io.ReadWriter, command string, args string) error {
+	if err := WriteCommand(rw, command, args); err != nil {
+		return err
+	}
+	return ReadStatus(rw)
+}
+
+func WriteCommand(w io.Writer, command string, args string) error {
+	// TODO clean null bytes from command and args
+	buf := []byte(command)
+	if len(args) > 0 {
+		buf = append(buf, " "+strings.TrimSpace(args)...)
+	}
+	buf = append(buf, NullMarker)
+	_, err := w.Write(buf)
+	return err
+}
+
+func ReadCommand(r io.Reader) (string, []byte, error) {
+	// TBH there is probably a better way to read this without using string/[]byte conversions but I'll figure it out
+	// later. I don't think it costs anything to switch between the two tho. It just might be "cooler" code.
+	str, err := ReadStringUntilNull(r)
+	if err != nil {
+		return "", []byte{}, err
+	}
+
+	xs := strings.SplitN(str, " ", 2)
+	cmd := xs[0]
+
+	if !ReCommand.MatchString(cmd) {
+		return "", []byte{}, ErrInvalidCommandFormat
+	}
+
+	var input string
+	if len(xs) >= 2 {
+		input = xs[1]
+	}
+	return cmd, []byte(input), nil
 }
 
 // This is just a little lion to help you see whats going on.
