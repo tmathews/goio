@@ -28,14 +28,21 @@ package goio
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
+	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // This is the delimiter we use for commands in the protocol. The other way to determine how to read is by declaring
@@ -122,7 +129,7 @@ func ReadSize(r io.Reader) (uint64, error) {
 	return size, nil
 }
 
-func ReadUntilByte(r io.Reader, b byte) ([]byte, error) {
+func ReadUntilByte(r io.Reader, xs ...byte) ([]byte, error) {
 	var buf []byte
 	for {
 		chunk := make([]byte, 1)
@@ -131,9 +138,10 @@ func ReadUntilByte(r io.Reader, b byte) ([]byte, error) {
 		}
 		buf = append(buf, chunk...)
 		if len(buf) >= 1 {
-			if buf[len(buf)-1:][0] == b {
-				//fmt.Printf("READ: '%v'\n", buf)
-				return buf[:len(buf)-1], nil
+			for _, x := range xs {
+				if buf[len(buf)-1:][0] == x {
+					return buf[:len(buf)-1], nil
+				}
 			}
 		}
 	}
@@ -307,4 +315,63 @@ func (s *Server) Listen(address string, insecure bool) (net.Listener, error) {
 		Rand:               rand.Reader,
 	}
 	return tls.Listen("tcp", address, s.Conf)
+}
+
+func GenerateCerts(organization string, validFor time.Duration) (*x509.Certificate, *rsa.PrivateKey, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{organization},
+		},
+		NotBefore:             now,
+		NotAfter:              now.Add(validFor),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+
+	bytes, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certificate, err := x509.ParseCertificate(bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return certificate, key, nil
+}
+
+func WriteCertificate(cert *x509.Certificate, filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+}
+
+func WritePrivateKey(key *rsa.PrivateKey, filename string) error {
+	bytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: "PRIVATE KEY", Bytes: bytes})
 }
